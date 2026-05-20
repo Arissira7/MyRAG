@@ -3,6 +3,7 @@
 核心设计思想：
 - Child Chunk (256 token): 用于精准召回，小粒度匹配查询
 - Parent Chunk (512 token): 用于完整上下文，提供语义完整的段落
+- 表格作为原子单元：表格不被打散，整体作为一个 segment 参与分块
 
 面试应答要点:
 Q: 切片粒度怎么选？
@@ -16,10 +17,16 @@ A: 长文档直接切片会打散语义。例如"第三条第一款"和"第三�
    如果被切到不同的 chunk，检索时只能命中最相关的那个。
    父子索引通过 child 定位 + parent 回溯，确保能拿到完整的语义段落。
 
+Q: 文档里有表格怎么处理？
+A: 表格是原子单元，不打散。表格有严格的行列结构，打散后语义完全丧失。
+   我们的策略：先识别表格结构 → 序列化表格 → 作为独立 segment 参与分块。
+   表格行数超过阈值时（>50行）才横向切分，否则整体保留。
+   如果表格前后的文本段落也很长，表格会随段落一起移入下一个 parent chunk。
+
 Q: 怎么按语义边界切？
 A: 按标题层级、表格边界、条款编号体系来识别语义边界。
-   我们定义了 separator 优先级：[## 标题, # 大标题, ### 小节, 空行分段, 句号, 分号]
-   优先用高级别分隔符切，如果段落仍然超过限制，再用低级别分隔符二次切。
+   separator 优先级：[## 标题, 表格, # 大标题, ### 小节, 空行分段, 句号, 分号]
+   表格优先级仅次于标题，因为它是最强的语义原子。
 """
 
 import hashlib
@@ -30,6 +37,304 @@ from typing import Any, Optional
 
 from src.config import get_config
 from src.metadata import ChunkMetadata
+
+
+class TableSegment:
+    """表格语义单元。"""
+
+    def __init__(
+        self,
+        table_text: str,
+        headers: list[str],
+        rows: list[list[str]],
+        caption: str = "",
+        token_count: int = 0,
+    ):
+        self.table_text = table_text
+        self.headers = headers
+        self.rows = rows
+        self.caption = caption
+        self.token_count = token_count
+
+    @property
+    def row_count(self) -> int:
+        return len(self.rows)
+
+    def is_wide(self, threshold: int = 6) -> bool:
+        """列数是否超过阈值。"""
+        return len(self.headers) >= threshold
+
+    def is_long(self, threshold: int = 50) -> bool:
+        """行数是否超过阈值。"""
+        return self.row_count >= threshold
+
+    def to_segment_text(self) -> str:
+        """转换为可分块的文本段落。"""
+        parts = []
+        if self.caption:
+            parts.append(f"[表格: {self.caption}]")
+        if self.headers:
+            parts.append("表头: " + " | ".join(self.headers))
+        if self.rows:
+            for row in self.rows:
+                parts.append(" | ".join(row))
+        return "\n".join(parts)
+
+
+class TableProcessor:
+    """表格识别与序列化处理器。
+
+    面试要点:
+    Q: 表格怎么处理的？
+    A: 表格是最强的语义原子，打散后行列对应关系完全丧失。
+       我们的策略：先识别表格结构 → 序列化 → 作为独立 segment 参与分块。
+
+    Q: 表格太长怎么办？
+    A: 分两种情况：
+       1. 列数多（>6列）：不切列，保留完整行。
+          因为"显存 | 算力 | 功耗"这三列必须在一起，分开就失去对比意义。
+       2. 行数多（>50行）：按行数横向切分，每段保留完整列结构。
+          长表格通常有大量数据行，切分后每段仍然是有意义的子表。
+    """
+
+    _MD_TABLE_PATTERN = re.compile(
+        r"(?:^保留此行避免副作用.*?\n|^\|.+\|(?:\n|$))+",
+        re.MULTILINE,
+    )
+    def _is_separator_line(self, line: str) -> bool:
+        """判断一行是否是 Markdown 表格的分隔行（如 |---|----|----|）。"""
+        cells = [c.strip() for c in line.split("|") if c.strip()]
+        if not cells:
+            return False
+        return all(self._is_dash_cell(c) for c in cells)
+
+    @staticmethod
+    def _is_dash_cell(cell: str) -> bool:
+        """判断一个单元格是否是分隔行单元格（如 "---"、"--:":）。"""
+        cell = cell.strip()
+        return cell == "---" or re.match(r"^:?-+:?$", cell) is not None
+
+    def extract_tables_from_text(self, text: str) -> list[TableSegment]:
+        """从文本中提取所有 Markdown 表格。
+
+        支持的表格格式:
+        | 列1 | 列2 | 列3 |
+        |-----|-----|-----|
+        | 值1 | 值2 | 值3 |
+
+        提取后：表格不参与文本分块，作为独立 TableSegment 返回。
+        """
+        tables: list[TableSegment] = []
+
+        lines = text.split("\n")
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if line.strip().startswith("|") and line.strip().endswith("|"):
+                table_lines = self._collect_table_lines(lines, i)
+                if table_lines:
+                    table = self._parse_markdown_table_lines(table_lines)
+                    if table:
+                        tables.append(table)
+                    i += len(table_lines)
+                    continue
+            i += 1
+
+        return tables
+
+    def _collect_table_lines(self, lines: list[str], start: int) -> list[str]:
+        """从 start 开始收集连续的表格行。"""
+        table_lines: list[str] = []
+        for j in range(start, len(lines)):
+            line = lines[j].strip()
+            if not line:
+                if table_lines:
+                    break
+                continue
+            if line.startswith("#") or line.startswith("//"):
+                if table_lines:
+                    break
+                continue
+            if self._is_separator_line(line) or (line.startswith("|") and line.endswith("|")):
+                table_lines.append(line)
+            else:
+                if table_lines:
+                    break
+                if not line.startswith("|"):
+                    break
+        return table_lines
+
+    def _parse_markdown_table(self, raw: str) -> Optional[TableSegment]:
+        """解析单个 Markdown 表格字符串（兼容旧接口）。"""
+        lines = [l.strip() for l in raw.strip().splitlines() if l.strip()]
+        return self._parse_markdown_table_lines(lines)
+
+    def _parse_markdown_table_lines(self, lines: list[str]) -> Optional[TableSegment]:
+        """解析一组 Markdown 表格行。"""
+        if len(lines) < 2:
+            return None
+
+        sep_idx = -1
+        for idx, line in enumerate(lines):
+            if self._is_separator_line(line):
+                sep_idx = idx
+                break
+
+        if sep_idx <= 0:
+            return None
+
+        header_line = lines[0].strip()
+        headers = [h.strip() for h in header_line.split("|") if h.strip()]
+
+        data_lines = lines[sep_idx + 1:]
+        rows: list[list[str]] = []
+        for line in data_lines:
+            stripped = line.strip()
+            if not stripped or stripped == "---":
+                continue
+            cells = [c.strip() for c in stripped.split("|") if c.strip() and c.strip() != "---"]
+            if cells:
+                rows.append(cells)
+
+        caption = ""
+        if headers and "表格" in headers[0]:
+            caption = headers[0]
+            headers = headers[1:]
+
+        table_text = self.to_markdown_string(headers, rows, caption)
+        token_count = self._estimate_table_tokens(headers, rows)
+
+        return TableSegment(
+            table_text=table_text,
+            headers=headers,
+            rows=rows,
+            caption=caption,
+            token_count=token_count,
+        )
+
+    def to_markdown_string(
+        self,
+        headers: list[str],
+        rows: list[list[str]],
+        caption: str = "",
+    ) -> str:
+        """将表格数据转回 Markdown 字符串（用于存储和 Embedding）。"""
+        lines: list[str] = []
+        if caption:
+            lines.append(f"**{caption}**")
+
+        header_line = "| " + " | ".join(headers) + " |"
+        lines.append(header_line)
+
+        sep_cells = ["---"] * len(headers)
+        sep_line = "| " + " | ".join(sep_cells) + " |"
+        lines.append(sep_line)
+
+        for row in rows:
+            padded_row = row + [""] * (len(headers) - len(row))
+            row_line = "| " + " | ".join(padded_row[:len(headers)]) + " |"
+            lines.append(row_line)
+
+        return "\n".join(lines)
+
+    def split_long_table(
+        self, table: TableSegment, max_rows_per_chunk: int = 30
+    ) -> list[TableSegment]:
+        """对超长表格按行数切分，每段保留完整列结构。
+
+        适用于：参数对照表、型号规格表等行数很多的表格。
+        切分策略：按 max_rows_per_chunk 切，不跨行切单元格。
+        """
+        if not table.is_long(threshold=50):
+            return [table]
+
+        result: list[TableSegment] = []
+        for i in range(0, len(table.rows), max_rows_per_chunk):
+            chunk_rows = table.rows[i:i + max_rows_per_chunk]
+            sub_caption = f"{table.caption}（第{i + 1}-{i + len(chunk_rows)}行）" if table.caption else f"表格（第{i + 1}-{i + len(chunk_rows)}行）"
+
+            sub_text = self.to_markdown_string(table.headers, chunk_rows, sub_caption)
+            result.append(TableSegment(
+                table_text=sub_text,
+                headers=table.headers,
+                rows=chunk_rows,
+                caption=sub_caption,
+                token_count=self._estimate_table_tokens(table.headers, chunk_rows),
+            ))
+
+        return result
+
+    def remove_tables_from_text(self, text: str) -> str:
+        """将文本中的 Markdown 表格替换为占位符（用于后续分块）。"""
+        lines = text.split("\n")
+        result_lines: list[str] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if line.startswith("|") and line.endswith("|"):
+                if self._is_separator_line(line):
+                    if result_lines and result_lines[-1] != "[表格占位符]":
+                        result_lines.append("[表格占位符]")
+                    i += 1
+                    continue
+                table_lines = self._collect_table_lines(lines, i)
+                if len(table_lines) >= 2:
+                    if result_lines and result_lines[-1] != "[表格占位符]":
+                        result_lines.append("[表格占位符]")
+                    i += len(table_lines)
+                    continue
+            result_lines.append(lines[i])
+            i += 1
+        return "\n".join(result_lines)
+
+    def insert_tables_into_segments(
+        self,
+        plain_segments: list[str],
+        tables: list[TableSegment],
+    ) -> list[str]:
+        """将表格插回到文本段落流中。
+
+        策略：遍历文本段落，每遇到一个表格占位符，就用对应的 TableSegment 替代。
+        如果表格前后的文本段落也很长，表格会随段落一起进入下一个 parent chunk。
+        这样保证：表格永远是完整的，不会被打散到两个 chunk 中。
+        """
+        result: list[str] = []
+        table_idx = 0
+
+        for segment in plain_segments:
+            if "[表格占位符]" in segment:
+                parts = segment.split("[表格占位符]")
+                for j, part in enumerate(parts):
+                    part = part.strip()
+                    if part:
+                        result.append(part)
+                    if j < len(parts) - 1 and table_idx < len(tables):
+                        result.append(tables[table_idx].to_segment_text())
+                        table_idx += 1
+            else:
+                if segment.strip():
+                    result.append(segment)
+
+        while table_idx < len(tables):
+            result.append(tables[table_idx].to_segment_text())
+            table_idx += 1
+
+        return result
+
+    def _estimate_table_tokens(self, headers: list[str], rows: list[list[str]]) -> int:
+        """估算表格的 token 数。"""
+        all_text = " ".join(headers)
+        for row in rows:
+            all_text += " " + " ".join(row)
+        return SemanticChunker._estimate_tokens(all_text)
+
+    def is_table_row(self, line: str) -> bool:
+        """判断一行是否是 Markdown 表格的数据行。"""
+        stripped = line.strip()
+        if not (stripped.startswith("|") and stripped.endswith("|")):
+            return False
+        cells = [c.strip() for c in stripped.split("|") if c.strip()]
+        return len(cells) >= 2 and not all(c in ("---", "") for c in cells)
 
 
 @dataclass
@@ -154,12 +459,18 @@ class SemanticChunker:
     """语义分块器 — 实现 Parent-Child Indexing。
 
     策略：
-    1. 先按语义边界（标题层级、空行、标点）把文档切成一组"段落"
-    2. 把段落组织成 parent_chunk（多个段落合并，目标 512 token）
-    3. 再把 parent_chunk 切分成 child_chunk（256 token）
-    4. 建立 child_id → parent_id 映射
+    1. 先用 TableProcessor 提取表格 → 序列化 → 作为 TableSegment
+    2. 表格从原文中移除，保留占位符
+    3. 剩余文本按语义边界切分（标题层级、空行、标点）
+    4. 将 TableSegment 插回到段落流中
+    5. 把段落组织成 parent_chunk（多个段落+表格合并，目标 512 token）
+    6. 再把 parent_chunk 切分成 child_chunk（256 token）
+    7. 建立 child_id → parent_id 映射
 
-    这样检索时用 child 精准匹配，回答时回溯到 parent 取完整语义。
+    表格处理原则：
+    - 表格不打散：行列结构必须完整保留
+    - 超长表格（>50行）按行数切分，每段保留完整列
+    - 表格随周围段落一起移入 parent chunk，不单独成 chunk
     """
 
     def __init__(
@@ -173,6 +484,7 @@ class SemanticChunker:
         self.child_chunk_size = child_chunk_size
         self.chunk_overlap = chunk_overlap
         self.text_splitter = TextSplitter(separators=separators)
+        self.table_processor = TableProcessor()
 
     def chunk_document(
         self,
@@ -187,7 +499,7 @@ class SemanticChunker:
         Args:
             doc_id: 文档ID
             doc_title: 文档标题
-            content: 文档全文
+            content: 文档全文（可能包含表格）
             metadata: 文档级 metadata
             sections: 预分好的章节（来自 document_loader）
 
@@ -197,9 +509,21 @@ class SemanticChunker:
         meta = metadata or {}
 
         if sections:
-            segments = [s["text"] for s in sections if s.get("text")]
+            segments = []
+            for sec in sections:
+                sec_text = sec.get("text", "")
+                tables = self.table_processor.extract_tables_from_text(sec_text)
+                plain_text = self.table_processor.remove_tables_from_text(sec_text)
+                sub_segs = self.text_splitter.split_text(plain_text)
+                sub_segs = self.table_processor.insert_tables_into_segments(sub_segs, tables)
+                segments.extend(sub_segs)
         else:
-            segments = self.text_splitter.split_text(content)
+            tables = self.table_processor.extract_tables_from_text(content)
+            plain_text = self.table_processor.remove_tables_from_text(content)
+            segments = self.text_splitter.split_text(plain_text)
+            segments = self.table_processor.insert_tables_into_segments(segments, tables)
+
+        segments = [s for s in segments if s.strip()]
 
         parent_chunks = self._build_parent_chunks(segments)
 
