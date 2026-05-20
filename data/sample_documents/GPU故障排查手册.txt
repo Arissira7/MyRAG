@@ -1,0 +1,357 @@
+# GPU 故障排查手册
+
+## 1. 文档说明
+
+本手册提供算力集群 GPU 常见故障的诊断流程和处理方法，帮助运维人员快速定位和解决 GPU 相关问题。
+
+## 2. 故障分类
+
+### 2.1 故障等级定义
+
+| 等级 | 名称 | 影响范围 | 响应时间 | 解决时间 |
+|------|------|----------|----------|----------|
+| P1 | 紧急 | 单节点多 GPU 故障 | 5 分钟 | 1 小时 |
+| P2 | 严重 | 单 GPU 不可用 | 15 分钟 | 4 小时 |
+| P3 | 警告 | GPU 性能降级 | 1 小时 | 24 小时 |
+| P4 | 提示 | 告警通知 | 4 小时 | 72 小时 |
+
+### 2.2 常见故障类型
+
+| 故障类型 | 占比 | 平均修复时间 |
+|----------|------|--------------|
+| GPU 掉卡 | 45% | 30 分钟 |
+| ECC 错误 | 25% | 15 分钟 |
+| NVLink 链路降级 | 15% | 1 小时 |
+| Xid 错误 | 10% | 45 分钟 |
+| 温度异常 | 5% | 20 分钟 |
+
+## 3. 故障诊断工具
+
+### 3.1 常用命令
+
+```bash
+# 查看 GPU 状态
+nvidia-smi
+
+# 详细诊断信息
+nvidia-smi -q
+
+# GPU 拓扑结构
+nvidia-smi topo -m
+
+# 刷新 ECC 计数
+nvidia-smi -r
+
+# 查看 NVLink 状态
+nvidia-smi nvlink -s
+```
+
+### 3.2 NVSM 告警阈值
+
+| 指标 | 正常值 | 预警值 | 告警值 | 严重告警 |
+|------|--------|--------|--------|----------|
+| GPU 温度 | < 75°C | > 80°C | > 85°C | > 90°C |
+| GPU 利用率 | > 50% | < 30% | < 10% | 0% |
+| 显存使用率 | < 90% | > 95% | - | - |
+| ECC 错误率 | 0 | > 10/小时 | > 100/小时 | > 1000/小时 |
+| PCIe 带宽 | > 80% | < 50% | < 20% | - |
+
+## 4. ECC 错误处理
+
+### 4.1 ECC 错误类型
+
+| 类型 | 说明 | 影响 | 处理方式 |
+|------|------|------|----------|
+| EccSecError | 单比特错误 | 可纠正 | 自动修复 + 记录 |
+| EccDedError | 双比特错误 | 不可纠正 | 需迁移数据 |
+
+### 4.2 ECC 错误处理流程
+
+```bash
+# 1. 检查 ECC 状态
+nvidia-smi -q -d ECC
+
+# 示例输出：
+# Ecc Mode
+#   Current    : Enabled
+#   Pending    : Disabled
+# ECC Errors
+#   Volatile   : 
+#     SRAM   [Double Bit] : 0
+#             [Single Bit] : 156
+#   Aggregate  : 
+#     SRAM   [Double Bit] : 2
+#             [Single Bit] : 1523
+
+# 2. 分析错误频率
+# 单比特错误 < 10/天: 正常
+# 单比特错误 > 100/天: 硬件问题
+# 双比特错误: 立即更换 GPU
+
+# 3. 重置 ECC 计数
+nvidia-smi -r
+
+# 4. 如果持续报错，标记 GPU 待更换
+```
+
+### 4.3 ECC 告警配置
+
+```yaml
+nvsm_alerts:
+  ecc_single_bit:
+    threshold: 100  # 24小时阈值
+    severity: warning
+    
+  ecc_double_bit:
+    threshold: 1
+    severity: critical
+    action: immediate_replacement
+```
+
+## 5. NVLink 链路降级
+
+### 5.1 NVLink 正常状态
+
+```bash
+nvidia-smi nvlink -s
+
+# 正常输出示例 (8-GPU 系统):
+# NVLink status for gpu 00000000:1A:00.0
+#   Link 0: enabled
+#   Link 1: enabled
+#   Link 2: enabled
+#   Link 3: enabled
+#   Link 4: enabled
+#   Link 5: enabled
+#   Link 6: enabled
+#   Link 7: enabled
+#   Link 8: enabled
+#   Link 9: enabled
+#   Link 10: enabled
+#   Link 11: enabled
+```
+
+### 5.2 NVLink 降级处理
+
+**降级级别：**
+| 降级级别 | 可用链路 | 带宽损失 | 处理策略 |
+|----------|----------|----------|----------|
+| 正常 | 12/12 | 0% | 无需处理 |
+| 轻度 | 8-11 | 8-33% | 监控 |
+| 中度 | 4-7 | 33-67% | 降低训练规模 |
+| 重度 | 1-3 | > 67% | 申请维修 |
+| 失效 | 0 | 100% | 立即停机 |
+
+**处理流程：**
+```bash
+# 1. 检测链路状态
+nvidia-smi nvlink -e 0
+
+# 2. 查看错误计数
+cat /proc/driver/nvidia/nvlink/errors
+
+# 3. 重置 NVLink (不重启)
+nvidia-smi nvlink --reset
+
+# 4. 如果持续降级
+# - 降低使用 GPU 数量
+# - 标记节点为维护状态
+# - 提交故障工单
+```
+
+## 6. Xid 错误码详解
+
+### 6.1 常见 Xid 错误
+
+| Xid 码 | 含义 | 原因 | 解决方案 |
+|--------|------|------|----------|
+| Xid 13 | GPU 内部异常 | ECC 错误累积 | 检查 ECC 状态 |
+| Xid 14 | PCIe 通信超时 | 链路不稳定 | 检查 PCIe 插槽 |
+| Xid 15 | 视频 BIOS 中断 | 驱动异常 | 重装驱动 |
+| Xid 16 | GPU 温度过高 | 散热问题 | 检查散热系统 |
+| Xid 18 | 视频引擎异常 | 硬件故障 | 更换 GPU |
+| Xid 31 | 电源模块异常 | 供电不足 | 检查电源 |
+| Xid 32 | ECC 多位错误 | 显存故障 | 更换 GPU |
+| Xid 43-45 | NVLink 故障 | 链路异常 | 检查 NVLink 桥接 |
+| Xid 48 | 电压异常 | 供电问题 | 检查电源模块 |
+| Xid 63 | 外部 PCIe 错误 | 主板问题 | 检查主板 |
+
+### 6.2 Xid 错误分析
+
+```bash
+# 1. 收集 Xid 日志
+cat /var/log/syslog | grep -i xid
+dmesg | grep -i nvidia
+
+# 2. 解析 Xid 错误
+# 格式：GPU 0: Xid 48 错误详情
+# GPU 0: Xid 48, pid=1234, name=python, data=00000000...
+
+# 3. 关联分析
+# 结合 nvidia-smi -q 输出分析故障时间线
+```
+
+### 6.3 常见 Xid 故障处理
+
+**Xid 13 (GPU 内部异常)：**
+```bash
+# 检查 ECC 错误
+nvidia-smi -q -d ECC
+
+# 如果单比特错误累积 > 1000
+# 标记 GPU 为可疑状态
+# 安排预防性更换
+```
+
+**Xid 14 (PCIe 通信超时)：**
+```bash
+# 检查 PCIe 链路状态
+nvidia-smi topo -m
+
+# 检查 PCIe 带宽
+nvidia-smi -q | grep -A 10 "PCIe"
+
+# 可能的解决方案
+# - 重新插拔 GPU
+# - 更换 PCIe 插槽
+# - 更新主板 BIOS
+```
+
+**Xid 16 (温度过高)：**
+```bash
+# 查看温度历史
+nvidia-smi -q -d TEMPERATURE
+
+# 检查散热系统
+ipmitool sensor | grep -i temp
+
+# 可能原因
+# - 冷通道温度超标
+# - 风扇故障
+# - 散热片堵塞
+```
+
+## 7. GPU 掉卡处理
+
+### 7.1 掉卡识别
+
+```bash
+# 检查 GPU 可见性
+nvidia-smi
+
+# 如果 GPU 丢失，输出类似：
+# Unable to query GPU information. CUDA_ERROR_NOT_FOUND
+
+# 检查 NVLink 拓扑
+nvidia-smi topo -m
+
+# 查看系统日志
+grep -i "nvidia" /var/log/syslog | tail -50
+```
+
+### 7.2 掉卡处理流程
+
+```
+GPU 掉卡检测
+    ↓
+立即标记节点不可用
+    ↓
+检查 GPU 电源和连接
+    ↓
+┌──────────────────────────────────┐
+│ 硬件层面检查：                     │
+│ 1. 检查 GPU 指示灯状态            │
+│ 2. 测量 GPU 12V 电源              │
+│ 3. 检查 PCIe 插槽接触             │
+│ 4. 尝试重新插拔 GPU               │
+└──────────────────────────────────┘
+    ↓
+┌──────────────────────────────────┐
+│ 软件层面检查：                     │
+│ 1. 重启 NV driver (nvidia-smi -r) │
+│ 2. 检查 dmesg 日志                │
+│ 3. 验证 CUDA 版本兼容性           │
+└──────────────────────────────────┘
+    ↓
+如果无法恢复 → 更换 GPU
+```
+
+### 7.3 预防性措施
+
+| 措施 | 说明 |
+|------|------|
+| 定期检查 | 每周运行 nvidia-smi 全量检查 |
+| 温度监控 | 实时监控，超过 85°C 告警 |
+| 固件更新 | 每季度更新 GPU 固件 |
+| 电源监控 | 监控 12V 供电波动 |
+| 振动检测 | 检测机箱振动异常 |
+
+## 8. 故障自愈机制
+
+### 8.1 自动恢复策略
+
+| 故障类型 | 自动恢复动作 | 最大重试 |
+|----------|--------------|----------|
+| 临时掉卡 | 驱动重置 | 3 次 |
+| 单链路降级 | 流量重路由 | - |
+| 显存 ECC 单比特 | 自动纠正 | - |
+| 进程崩溃 | 作业重新调度 | 5 次 |
+
+### 8.2 自愈脚本
+
+```bash
+#!/bin/bash
+# gpu_health_check.sh - GPU 健康检查脚本
+
+LOG_FILE="/var/log/gpu_health.log"
+
+while true; do
+    # 检查 GPU 状态
+    nvidia-smi --query-gpu=index,name,temperature.gpu,utilization.gpu,ecc.errors.count.volatile.singleBit \
+               --format=csv,noheader >> $LOG_FILE
+    
+    # 检查 ECC 错误
+    ECC_ERRORS=$(nvidia-smi -q -d ECC | grep "Single Bit" | awk '{print $NF}')
+    if [ $ECC_ERRORS -gt 100 ]; then
+        send_alert "ECC error count exceeds threshold"
+    fi
+    
+    # 检查温度
+    TEMP=$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader)
+    if [ $TEMP -gt 85 ]; then
+        send_alert "GPU temperature critical: $TEMP°C"
+    fi
+    
+    sleep 60
+done
+```
+
+## 9. 故障工单模板
+
+```yaml
+工单类型: GPU 故障
+优先级: P2
+
+故障描述:
+- 节点: compute-042
+- GPU: GPU 3
+- 现象: Xid 32 错误
+- 首次发现时间: 2026-04-01 14:30
+
+诊断信息:
+- ECC Double Bit: 3
+- 故障次数: 5次/小时
+- 链路状态: 正常
+
+已采取的措施:
+1. 重启驱动 - 无效
+2. 重置 ECC - 错误继续累积
+
+建议处理:
+更换 GPU 3，预计修复时间 2 小时
+```
+
+---
+
+技术支持邮箱：gpu-support@company.com
+GPU 备件库：机房 B2 层，货架 A-15

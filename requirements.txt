@@ -1,0 +1,32 @@
+# 核心依赖
+langchain>=0.1.0
+
+# 本地模型推理
+ollama>=0.1.0          # Ollama Python SDK
+requests>=2.31.0       # HTTP 请求库
+
+# Embedding & 向量检索
+faiss-cpu>=1.7.4       # Facebook AI 语义向量检索
+
+# BM25 检索
+rank-bm25>=0.2.2       # BM25 算法实现
+
+# 中文分词
+jieba>=0.42.1          # 中文分词
+
+# 文档解析
+pymupdf>=1.23.0        # PDF 解析 (PyMuPDF)
+python-docx>=1.1.0     # Word 文档解析
+
+# 配置管理
+pyyaml>=6.0.1          # YAML 配置文件解析
+
+# 数据处理
+numpy>=1.24.0          # 数值计算
+scipy>=1.11.0          # 科学计算（置信区间、t-test）
+
+# 测试
+pytest>=7.4.0           # 单元测试框架
+
+# 类型提示（可选，但建议安装）
+typing-extensions>=4.8.0

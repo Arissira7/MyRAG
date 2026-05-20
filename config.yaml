@@ -1,0 +1,118 @@
+# ===========================
+# 部门智能RAG问答助手 - 配置文件
+# ===========================
+
+# ---------- LLM 配置 ----------
+llm:
+  # 使用 Qwen 本地模型（通过 Ollama 或 vLLM 部署）
+  model_name: "qwen2.5:7b"
+  base_url: "http://localhost:11434"       # Ollama 默认地址
+  # base_url: "http://localhost:8000"     # vLLM 地址备用
+  temperature: 0.1
+  max_tokens: 2048
+  timeout: 60
+
+# ---------- Embedding 配置 ----------
+embedding:
+  # Qwen3-Embedding 模型（通过 Ollama 部署）
+  model_name: "qwen3-embedding:latest"
+  base_url: "http://localhost:11434"
+  dimension: 1024                        # Qwen3-Embedding 输出维度
+  batch_size: 32
+  normalize: true                        # 是否归一化向量
+
+# ---------- Cross-Encoder 重排配置 ----------
+reranker:
+  # 使用 Qwen 本地模型做 Cross-Encoder
+  model_name: "qwen2.5:1.5b"
+  base_url: "http://localhost:11434"
+  top_n: 10                              # 重排后取 top-N
+  batch_size: 8
+
+# ---------- 文档处理配置 ----------
+document:
+  supported_formats:
+    - ".pdf"
+    - ".txt"
+    - ".md"
+    - ".docx"
+  chunk_size: 512                       # 父级 chunk 目标 token 数
+  child_chunk_size: 256                  # 子级 chunk token 数
+  chunk_overlap: 64                      # chunk 之间重叠 token 数
+  # 语义分块分隔符（按优先级）
+  separators:
+    - "\n## "
+    - "\n# "
+    - "\n### "
+    - "\n\n"
+    - "\n"
+    - "。"
+    - "；"
+
+# ---------- 检索配置 ----------
+retrieval:
+  top_k_bm25: 20                         # BM25 召回数量
+  top_k_dense: 20                       # 稠密向量召回数量
+  fusion_alpha: 0.5                      # 融合权重: alpha*BM25 + (1-alpha)*Dense
+  # RRF 融合参数（备选融合方案）
+  rrf_k: 60                              # RRF 公式中的 k 参数
+  enable_tenant_filter: true            # 启用多租户过滤
+
+# ---------- Dynamic Top-K 调度配置 ----------
+dynamic_scheduler:
+  # 分数分布阈值参数
+  std_threshold: 0.15                   # 标准差阈值，超过则减少 chunks
+  score_gap_threshold: 0.05             # 相邻分数差距阈值
+  min_chunks: 3                         # 最少提交 chunks 数
+  max_chunks: 10                        # 最多提交 chunks 数
+  # 冷启动：初始 top_k（当分数分布无法计算时）
+  initial_top_k: 5
+
+# ---------- 查询改写配置 ----------
+query_rewriter:
+  enabled: true
+  max_subqueries: 3                     # 最多分解为 3 个子查询
+  history_window: 5                     # 历史对话滑动窗口大小
+  # 领域同义词词典路径（可选）
+  synonym_dict_path: null
+
+# ---------- 多租户配置 ----------
+tenant:
+  required_fields:
+    - "tenant_id"                        # 必填：租户ID
+    - "department"                      # 必填：部门
+  optional_fields:
+    - "doc_type"                        # 文档类型
+    - "created_at"                      # 创建时间
+    - "author"                          # 作者
+    - "level"                           # 保密级别
+
+# ---------- 存储配置 ----------
+storage:
+  bm25_index_path: "./data/indices/bm25.pkl"
+  vector_index_path: "./data/indices/vector.index"
+  chunk_store_path: "./data/indices/chunks.json"
+  parent_child_map_path: "./data/indices/parent_child.json"
+
+# ---------- 评测配置 ----------
+evaluation:
+  benchmark_path: "./data/evaluation/benchmark.json"
+  metrics:
+    - "recall@5"
+    - "recall@10"
+    - "mrr"
+    - "ndcg@5"
+    - "ndcg@10"
+  k_values: [1, 3, 5, 10]
+  baseline_methods:
+    - "fixed_top5"                       # 固定 top-5
+    - "dense_only"                      # 仅向量检索
+    - "bm25_only"                       # 仅 BM25
+    - "no_rerank"                       # 不重排
+    - "full_pipeline"                   # 完整 pipeline
+  confidence_level: 0.95               # 置信区间置信度
+
+# ---------- 日志配置 ----------
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

@@ -1,0 +1,281 @@
+# PyTorch 分布式训练配置指南
+
+## 1. 文档目的
+
+本指南提供在算力集群上进行 PyTorch 分布式训练的完整配置说明，包括环境设置、通信配置、并行策略和性能优化建议。
+
+## 2. 环境配置
+
+### 2.1 基础环境
+
+| 组件 | 版本要求 | 说明 |
+|------|----------|------|
+| Python | 3.9+ | 推荐 3.10 |
+| PyTorch | 2.1+ | 推荐 2.2 (CUDA 12.x) |
+| CUDA | 12.1+ | 支持 TransformerEngine |
+| NCCL | 2.19+ | 性能优化关键 |
+| cuDNN | 8.9+ | 加速卷积运算 |
+
+### 2.2 通信后端选择
+
+| 后端 | 适用场景 | 带宽 | 延迟 |
+|------|----------|------|------|
+| NCCL | GPU-GPU 通信 (推荐) | 900 GB/s | < 1 μs |
+| GLOO | CPU/GPU 混合 | - | 较高 |
+| MPI | 多机扩展 | - | 低 |
+
+**配置示例：**
+```bash
+# 设置 NCCL 通信后端
+export NCCL_DEBUG=INFO
+export NCCL_IB_TIMEOUT=22
+export NCCL_IB_RETRY_CNT=7
+export NCCL_NET_GDR_LEVEL=PHB
+
+# 多机训练启动
+torchrun \
+    --nnodes=4 \
+    --nproc_per_node=8 \
+    --rdzv_id=12345 \
+    --rdzv_backend=c10d \
+    --rdzv_endpoint=10.0.0.1:29500 \
+    train.py
+```
+
+## 3. 张量并行 (Tensor Parallelism)
+
+### 3.1 原理说明
+
+张量并行将单个层的参数矩阵按列或行分割到多个 GPU，实现计算和显存的分布式处理。
+
+### 3.2 配置方法
+
+```python
+import torch
+from torch.distributed.tensor.parallel import (
+    RowParallelLinear,
+    ColParallelLinear,
+    parallelize_module,
+)
+
+# Megatron-LM 风格配置
+TP_SIZE = 8  # 张量并行度
+PP_SIZE = 4  # 流水线并行度
+DP_SIZE = 16 # 数据并行度
+
+# 确保 TP_SIZE × PP_SIZE × DP_SIZE = 总 GPU 数
+```
+
+### 3.3 张量并行配置参数
+
+| 参数 | 推荐值 | 说明 |
+|------|--------|------|
+| tensor_parallel_size | 8 | 建议 2/4/8 |
+| memory_fraction | 0.9 | GPU 显存使用比例 |
+| gather_output | True | 是否汇聚输出 |
+
+## 4. 流水线并行 (Pipeline Parallelism)
+
+### 4.1 流水线策略
+
+| 策略 | 说明 | 优点 | 缺点 |
+|------|------|------|------|
+| 1F1B | 1 Forward 1 Backward | 内存占用低 | 流水线不饱满 |
+| Interleaved | 交错执行 | 效率更高 | 实现复杂 |
+| GPipe | 同步流水线 | 正确性保证 | 气泡多 |
+
+### 4.2 流水线配置
+
+```python
+from torch.distributed.pipeline.sync import Pipe
+
+# 流水线配置
+BATCH_SIZE = 32
+MICRO_BATCH_SIZE = 2
+NUM_MICRO_BATCHES = BATCH_SIZE // MICRO_BATCH_SIZE
+
+# 流水线并行封装
+model = Pipe(model, chunks=MICRO_BATCH_SIZE)
+```
+
+### 4.3 流水线参数调优
+
+| 参数 | 小规模 | 中规模 | 大规模 |
+|------|--------|--------|--------|
+| PP_SIZE | 2 | 4 | 8 |
+| MICRO_BATCH_SIZE | 4-8 | 2-4 | 1-2 |
+| NUM_STAGES | 12 | 24 | 48 |
+
+## 5. ZeRO 优化器配置
+
+### 5.1 ZeRO 阶段说明
+
+| 阶段 | 优化内容 | 显存节省 | 通信开销 |
+|------|----------|----------|----------|
+| ZeRO-1 | 分片优化器状态 | ~4x | 略有增加 |
+| ZeRO-2 | + 分片梯度 | ~8x | 略有增加 |
+| ZeRO-3 | + 分片参数 | ~N倍 | 显著增加 |
+| ZeRO-Offload | CPU 卸载 | 极大 | 显著增加 |
+
+### 5.2 ZeRO 配置示例
+
+```python
+# ZeRO Stage 1 配置 (推荐入门)
+ZERO_STAGE = 1
+ optimizer = ZeROOptimizer(
+     optimizer,
+     stage=ZERO_STAGE,
+     param_groups=True,
+ )
+
+# ZeRO Stage 2 配置 (平衡方案)
+ZERO_STAGE = 2
+deepspeed_config = {
+    "zero_optimization": {
+        "stage": 2,
+        "offload_optimizer": {
+            "device": "cpu",
+            "pin_memory": True
+        },
+        "allgather_partitions": True,
+        "allgather_bucket_size": 5e7,
+        "overlap_comm": True,
+        "reduce_scatter": True,
+        "reduce_bucket_size": 5e7,
+        "contiguous_gradients": True
+    }
+}
+
+# ZeRO Stage 3 配置 (极致显存优化)
+ZERO_STAGE = 3
+deepspeed_config = {
+    "zero_optimization": {
+        "stage": 3,
+        "stage3_param_persistence_threshold": 1e4,
+        "stage3_gather_16bit_weights_on_model_save": True
+    }
+}
+```
+
+### 5.3 DeepSpeed ZeRO 配置
+
+```json
+{
+    "zero_optimization": {
+        "stage": 3,
+        "stage3_param_persistence_threshold": "1e4",
+        "stage3_max_live_parameters": "1e9",
+        "stage3_prefetch_bucket_size": "1e6",
+        "stage3_max_reuse_distance": "1e6",
+        "stage3_gather_16bit_weights_on_model_save": true
+    },
+    "gradient_clipping": 1.0,
+    "gradient_accumulation_steps": 1,
+    "steps_per_print": 100
+}
+```
+
+## 6. 梯度累积
+
+### 6.1 配置方法
+
+```python
+# 梯度累积步数配置
+GRADIENT_ACCUMULATION_STEPS = 4
+EFFECTIVE_BATCH_SIZE = BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * DP_SIZE
+
+# PyTorch 原生实现
+for step, batch in enumerate(dataloader):
+    outputs = model(batch)
+    loss = criterion(outputs, target)
+    loss = loss / GRADIENT_ACCUMULATION_STEPS
+    loss.backward()
+    
+    if (step + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+        optimizer.step()
+        optimizer.zero_grad()
+```
+
+### 6.2 推荐配置
+
+| 总 batch size | 单卡 batch | 累积步数 | 数据并行度 |
+|---------------|------------|----------|------------|
+| 4096 | 8 | 4 | 128 |
+| 8192 | 8 | 4 | 256 |
+| 16384 | 8 | 8 | 256 |
+| 32768 | 8 | 16 | 256 |
+
+## 7. 混合精度训练
+
+### 7.1 BF16 vs FP16 对比
+
+| 特性 | BF16 | FP16 |
+|------|------|------|
+| 动态范围 | 8 bit 指数 | 5 bit 指数 |
+| 精度 | 更高 | 较低 |
+| 溢出风险 | 较低 | 较高 |
+| 性能 | 略低 | 略高 |
+| 推荐场景 | LLM 训练 | CV/NLP 分类 |
+
+### 7.2 混合精度配置
+
+```python
+from torch.cuda.amp import autocast, GradScaler
+
+# 推荐使用 BF16
+scaler = GradScaler('cuda')
+AUTOCAST_DTYPE = torch.bfloat16  # 推荐
+
+# 训练循环
+for batch in dataloader:
+    with autocast(dtype=AUTOCAST_DTYPE):
+        outputs = model(batch)
+        loss = criterion(outputs, target)
+    
+    scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    scaler.step(optimizer)
+    scaler.update()
+```
+
+### 7.3 Transformer Engine 配置
+
+```python
+# 使用 NVIDIA Transformer Engine
+from transformer_engine.pytorch import TransformerLayer, FP8Recipe
+
+fp8_recipe = FP8Recipe(name="transformer_engine")
+autocast(enabled=True, dtype=torch.bfloat16, grad_scaler=scaler)
+
+model = TransformerLayer(
+    hidden_states=hidden_states,
+    attention=attention,
+    mlp=mlp,
+)
+```
+
+## 8. 性能优化建议
+
+### 8.1 NCCL 调优
+
+```bash
+# 环境变量优化
+export NCCL_DEBUG=INFO
+export NCCL_IB_TIMEOUT=22
+export NCCL_IB_GID_INDEX=3
+export NCCL_NET_GDR_LEVEL=PHB
+export NCCL_ALGO=Ring  # Ring 或 Tree
+export NCCL_PROTO=Simple  # Simple 或 LL
+
+# GPU 直接访问
+export NCCL_IB_PKEY=0x8001
+```
+
+### 8.2 通信计算重叠
+
+```python
+# 启用通信计算重叠
+model = parallelize_module(
+    model,
+   策略优化可以显著提升训练效率。通过调整 NCCL 通信参数、启用 BF16 混合精度、使用梯度累积和流水线并行等技术，可以在保证模型质量的同时最大化 GPU 利用率。性能瓶颈通常出现在通信延迟和显存不足的场景，需要针对性地进行调优。
